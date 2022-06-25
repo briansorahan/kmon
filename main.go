@@ -25,6 +25,9 @@ func main() {
 	} else {
 		kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
 	}
+	var cronJobName, namespace string
+	flag.StringVar(&cronJobName, "j", "", "Cron job name (required).")
+	flag.StringVar(&namespace, "n", "", "Kubernetes namespace (required).")
 	flag.Parse()
 
 	// use the current context in kubeconfig
@@ -44,14 +47,11 @@ func main() {
 	}
 	defer f.Close()
 
-	var (
-		activeJob string
-		jobName   = "scraping-caiso-oasis-highfreq"
-		namespace = "sourcing"
-	)
+	var activeJob string
+
 GetJobsLoop:
 	for {
-		cronJob, err := client.BatchV1().CronJobs(namespace).Get(ctx, jobName, metav1.GetOptions{})
+		cronJob, err := client.BatchV1().CronJobs(namespace).Get(ctx, cronJobName, metav1.GetOptions{})
 		if err != nil {
 			panic(err)
 		}
@@ -74,7 +74,7 @@ GetJobsLoop:
 				panic(err)
 			}
 			fmt.Fprintf(f, "%s=%s\n", res.name, res.phase)
-
+			log.Printf("wrote pod status for pod %s (%s)", res.name, res.phase)
 		}
 		time.Sleep(5 * time.Second)
 	}
