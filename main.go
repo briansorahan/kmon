@@ -41,7 +41,7 @@ func main() {
 	}
 	ctx := context.Background()
 
-	f, err := os.OpenFile("pod_statuses", os.O_CREATE|os.O_APPEND, 644)
+	f, err := os.OpenFile(cronJobName+"_pod_statuses", os.O_CREATE|os.O_APPEND, 644)
 	if err != nil {
 		panic(err)
 	}
