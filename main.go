@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -39,16 +40,10 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	ctx := context.Background()
-
-	f, err := os.OpenFile(cronJobName+"_pod_statuses", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
-	if err != nil {
-		panic(err)
-	}
-	defer f.Close()
-
-	var activeJob string
-
+	var (
+		activeJob string
+		ctx       = context.Background()
+	)
 GetJobsLoop:
 	for {
 		cronJob, err := client.BatchV1().CronJobs(namespace).Get(ctx, cronJobName, metav1.GetOptions{})
@@ -69,26 +64,18 @@ GetJobsLoop:
 			// Start a goroutine that will monitor this job.
 			// TODO: wait for goroutines to finish if the program gets killed.
 			activeJob = newActiveJob
-			res, err := monitor(ctx, client, namespace, activeJob)
-			if err != nil {
+			if err := monitor(ctx, client, namespace, activeJob); err != nil {
 				panic(err)
 			}
-			fmt.Fprintf(f, "%s=%s\n", res.name, res.phase)
-			log.Printf("wrote pod status for pod %s (%s)", res.name, res.phase)
 		}
 		time.Sleep(5 * time.Second)
 	}
 }
 
-type podStatus struct {
-	name  string
-	phase coreapi.PodPhase
-}
-
-func monitor(ctx context.Context, client *kubernetes.Clientset, namespace, jobName string) (podStatus, error) {
+func monitor(ctx context.Context, client *kubernetes.Clientset, namespace, jobName string) error {
 	job, err := client.BatchV1().Jobs(namespace).Get(ctx, jobName, metav1.GetOptions{})
 	if err != nil {
-		return podStatus{}, fmt.Errorf("getting job: %w", err)
+		return fmt.Errorf("getting job: %w", err)
 	}
 	var labelSelector, sep string
 
@@ -96,10 +83,9 @@ func monitor(ctx context.Context, client *kubernetes.Clientset, namespace, jobNa
 		labelSelector += sep + k + "=" + v
 		sep = ","
 	}
-	var (
-		started bool
-		pods    = client.CoreV1().Pods(namespace)
-	)
+	pods := client.CoreV1().Pods(namespace)
+
+ListPods:
 	for {
 		select {
 		case <-ctx.Done():
@@ -108,40 +94,69 @@ func monitor(ctx context.Context, client *kubernetes.Clientset, namespace, jobNa
 				LabelSelector: labelSelector,
 			})
 			if err != nil {
-				return podStatus{}, fmt.Errorf("listing pods: %w", err)
+				return fmt.Errorf("listing pods: %w", err)
 			}
-			for _, pod := range podList.Items {
-				if !started && pod.Status.Phase == coreapi.PodRunning {
-					started = true
+			// If there are no running pods with the label we want then sleep and continue.
+			runningPod, hasRunningPod := getRunning(podList)
+			if !hasRunningPod {
+				time.Sleep(50 * time.Millisecond)
+				continue ListPods
+			}
+			log.Printf("pod %s has started running, tailing the logs", runningPod.Name)
 
-					log.Printf("pod %s has started running, tailing the logs", pod.Name)
+			// Start tailing the logs.
+			stream, err := pods.GetLogs(runningPod.Name, &coreapi.PodLogOptions{Follow: true}).Stream(ctx)
+			if err != nil {
+				return fmt.Errorf("getting log stream: %w", err)
+			}
+			filename := runningPod.Name + ".logs"
+			logFile, err := os.Create(filename)
+			if err != nil {
+				return fmt.Errorf("creating logg file: %w", err)
+			}
+			defer logFile.Close()
 
-					// Start tailing the logs.
-					stream, err := pods.GetLogs(pod.Name, &coreapi.PodLogOptions{Follow: true}).Stream(ctx)
-					if err != nil {
-						return podStatus{}, fmt.Errorf("getting log stream: %w", err)
-					}
-					filename := pod.Name + ".logs"
-					f, err := os.Create(filename)
-					if err != nil {
-						return podStatus{}, fmt.Errorf("opening file: %w", err)
-					}
-					defer f.Close()
+			if _, err := io.Copy(logFile, stream); err != nil {
+				return fmt.Errorf("streaming logs: %w", err)
+			}
+			// Sometimes the pod still has running status after the log stream
+			// is closed, so we wait until we see something other than running.
+			var final *coreapi.Pod
 
-					if _, err := io.Copy(f, stream); err != nil {
-						return podStatus{}, fmt.Errorf("streaming logs: %w", err)
-					}
-					final, err := pods.Get(ctx, pod.Name, metav1.GetOptions{})
-					if err != nil {
-						return podStatus{}, fmt.Errorf("getting pod: %w", err)
-					}
-					log.Printf("pod %s finished with status %s", pod.Name, final.Status.Phase)
-					log.Printf("monitor for %s finished", pod.Name)
-
-					return podStatus{name: pod.Name, phase: final.Status.Phase}, nil
+		PodFinishing:
+			for {
+				final, err = pods.Get(ctx, runningPod.Name, metav1.GetOptions{})
+				if err != nil {
+					return fmt.Errorf("getting pod: %w", err)
 				}
+				if final.Status.Phase == coreapi.PodRunning {
+					continue PodFinishing
+				}
+				time.Sleep(50 * time.Millisecond)
+				break
 			}
-			time.Sleep(50 * time.Millisecond)
+			log.Printf("pod %s finished with status %s", runningPod.Name, final.Status.Phase)
+
+			statusFile, err := os.Create(runningPod.Name + ".json")
+			if err != nil {
+				return fmt.Errorf("creating pod status file: %w", err)
+			}
+			defer statusFile.Close()
+
+			if err := json.NewEncoder(statusFile).Encode(final); err != nil {
+				return fmt.Errorf("writing pod status file: %w", err)
+			}
+			return nil
 		}
 	}
+}
+
+// getRunning will return the first running pod in the list and true, otherwise an empty Pod struct and false.
+func getRunning(podList *coreapi.PodList) (coreapi.Pod, bool) {
+	for _, pod := range podList.Items {
+		if phase := pod.Status.Phase; phase == coreapi.PodRunning {
+			return pod, true
+		}
+	}
+	return coreapi.Pod{}, false
 }
