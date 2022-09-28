@@ -9,7 +9,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	coreapi "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,8 +29,11 @@ func main() {
 	} else {
 		kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
 	}
-	var cronJobName, namespace string
-	flag.StringVar(&cronJobName, "j", "", "Cron job name (required).")
+	var (
+		jobNames  StringSlice
+		namespace string
+	)
+	flag.Var(&jobNames, "j", "Cron job name (required, can be provided multiple times).")
 	flag.StringVar(&namespace, "n", "", "Kubernetes namespace (required).")
 	flag.Parse()
 
@@ -40,10 +46,24 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	var (
-		activeJob string
-		ctx       = context.Background()
-	)
+	grp, ctx := errgroup.WithContext(context.Background())
+
+	for _, jobName := range jobNames {
+		job := jobName
+		grp.Go(func() error {
+			return watch(ctx, job, namespace, client)
+		})
+	}
+	if err := grp.Wait(); err != nil {
+		panic(err)
+	}
+}
+
+func watch(ctx context.Context, cronJobName, namespace string, client *kubernetes.Clientset) error {
+	log.Printf("monitoring %s", cronJobName)
+
+	var activeJob string
+
 GetJobsLoop:
 	for {
 		cronJob, err := client.BatchV1().CronJobs(namespace).Get(ctx, cronJobName, metav1.GetOptions{})
@@ -102,8 +122,6 @@ ListPods:
 				time.Sleep(50 * time.Millisecond)
 				continue ListPods
 			}
-			log.Printf("pod %s has started running, tailing the logs", runningPod.Name)
-
 			// Start tailing the logs.
 			stream, err := pods.GetLogs(runningPod.Name, &coreapi.PodLogOptions{Follow: true}).Stream(ctx)
 			if err != nil {
@@ -135,8 +153,9 @@ ListPods:
 				time.Sleep(50 * time.Millisecond)
 				break
 			}
-			log.Printf("pod %s finished with status %s", runningPod.Name, final.Status.Phase)
-
+			if final.Status.Phase == coreapi.PodFailed {
+				log.Printf("pod %s failed", runningPod.Name)
+			}
 			statusFile, err := os.Create(runningPod.Name + ".json")
 			if err != nil {
 				return fmt.Errorf("creating pod status file: %w", err)
@@ -159,4 +178,18 @@ func getRunning(podList *coreapi.PodList) (coreapi.Pod, bool) {
 		}
 	}
 	return coreapi.Pod{}, false
+}
+
+type StringSlice []string
+
+func (ss *StringSlice) String() string {
+	if ss == nil {
+		return ""
+	}
+	return strings.Join(*ss, "|")
+}
+
+func (ss *StringSlice) Set(s string) error {
+	*ss = append(*ss, s)
+	return nil
 }
